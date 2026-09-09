@@ -1,5 +1,5 @@
 /* ============================================================
- * 普宁医考·双人学习监督 主逻辑
+ * 小王早日上岸 主逻辑
  * 数据存 localStorage，零后端，可直接静态托管
  * ============================================================ */
 (function(){
@@ -11,6 +11,15 @@ var ROLE_ME = "me", ROLE_WIFE = "wife";
 var DATASET = { me: window.PY_DATA, wife: window.HL_DATA };
 var DEFAULT_EXAM_DATE = "2026-12-27"; // 笔试时间以官方通知为准，可在设置中修改
 var SIGNUP_END = "2026-09-16";
+
+/* ---------- 云同步（可选·Supabase 免费计划） ---------- */
+var CLOUD_KEY = "pny_cloud_v1";         // 云端配置存储 key
+var CLOUD_TABLE = "pny_sync";            // 数据库表名（需按 README 建表）
+var supabaseClient = null;               // supabase-js 客户端实例
+var cloudSub = null;                     // 实时订阅 channel
+var cloudQueue = null;                   // 防抖定时器
+var cloudStatus = "off";                 // off / loading / on / error
+var cloudInitStarted = false;
 
 /* ---------- 工具 ---------- */
 function $(sel, root){ return (root||document).querySelector(sel); }
@@ -38,7 +47,10 @@ function loadDB(){
   return { users:{ me:defaultUser("me"), wife:defaultUser("wife") }, active:"me", msgBoard:[] };
 }
 var DB = loadDB();
-function save(){ localStorage.setItem(LS_KEY, JSON.stringify(DB)); }
+function save(){
+  localStorage.setItem(LS_KEY, JSON.stringify(DB));
+  cloudQueuePush(false); // 云端已启用时自动实时推送本机进度
+}
 function activeUser(){ return DB.users[DB.active]; }
 function otherRole(){ return DB.active==="me" ? "wife" : "me"; }
 function otherUser(){ return DB.users[otherRole()]; }
@@ -78,7 +90,8 @@ function renderHome(){
 
   var me = u, wife = otherUser();
   var mePct = cnt ? Math.round(cnt/totalQ*100) : 0;
-  var wifeCnt = Object.keys(wife.correct).length;
+  var wifeImp = (DB.imported||{})[wife.role];
+  var wifeCnt = wifeImp ? Object.keys(wifeImp.correct||{}).length : Object.keys(wife.correct).length;
   var wifePct = wifeCnt ? Math.round(wifeCnt/data.questions.length*100) : 0;
 
   var c = $(".content"); c.innerHTML = "";
@@ -121,8 +134,10 @@ function renderHome(){
     "<h3>👀 双人进度对比</h3>"+
     pairRow("🐴 "+esc(me.name), mePct, mePct, "me")+
     pairRow("🌹 "+esc(wife.name), wifePct, wifePct, "wife")+
-    "<p class='sub' style='margin-top:6px'>注：若仅在本机学习，对方进度请在「监督」页导入对方的同步码后显示。</p>";
+    "<div id='cloudBadgeHome' class='cloud-badge' style='display:none;margin-top:8px'></div>"+
+    "<p class='sub' style='margin-top:6px'>对方进度：开启云端实时同步后自动更新；未开启时请在「监督」页导入对方的同步码。</p>";
   c.appendChild(pc);
+  refreshCloudUi();
 
   // 快捷操作
   var quick = el("div","card");
@@ -155,11 +170,23 @@ function calcStreak(arr){
 /* ============================================================
  * 复习
  * ============================================================ */
+function pointsHtml(ch){
+  return ch.points.map(function(p){return "<div class='point'><span class='dot'>•</span><span>"+esc(p)+"</span></div>";}).join("");
+}
+function mustKnowHtml(ch){
+  var h="<div class='mk-title'>⭐ 必背速记</div>";
+  ch.mustKnow.forEach(function(g){
+    h+="<div class='mk-group'><div class='mk-head'>"+esc(g.t)+"</div>";
+    g.items.forEach(function(it){ h+="<div class='mk-item'><span class='mk-arrow'>▸</span><span>"+esc(it)+"</span></div>"; });
+    h+="</div>";
+  });
+  return h;
+}
 function renderStudy(){
   var u=activeUser(); var data=DATASET[u.role];
   var c=$(".content"); c.innerHTML="";
   var head=el("div","card");
-  head.innerHTML="<h3>📚 复习资料 · "+esc(data.meta.subject)+"</h3><p class='sub'>点击章节展开知识点，读完可标记掌握；已掌握的章节会在第一屏汇总。</p>";
+  head.innerHTML="<h3>📚 复习资料 · "+esc(data.meta.subject)+"</h3><p class='sub'>点击章节展开：<b>『· 』为章节要点</b>，<b style='color:#e67700'>『⭐ 必背速记』</b>为按历年真题提炼的必背内容。读完可标记掌握。</p>";
   c.appendChild(head);
   var doneCount = data.chapters.filter(function(ch){return u.doneCh[ch.id];}).length;
   var doneCard=el("div","card");
@@ -173,7 +200,8 @@ function renderStudy(){
       "<div class='title'><b>"+esc(ch.title)+"</b><span>"+esc(ch.desc)+"</span></div>"+
       "<span class='arrow'>▼</span></div>"+
       "<div class='chapter-body'>"+
-        ch.points.map(function(p){return "<div class='point'><span class='dot'>•</span><span>"+esc(p)+"</span></div>";}).join("")+
+        pointsHtml(ch)+
+        (ch.mustKnow?mustKnowHtml(ch):"")+
         "<div style='margin-top:10px'><button class='btn sm "+(done?"ghost":"ok")+"' data-ch='"+ch.id+"'>"+(done?"已掌握（点击取消）":"标记为已掌握 ✅")+"</button></div>"+
       "</div>";
     c.appendChild(box);
@@ -208,6 +236,17 @@ function renderQuiz(){
 
 function accRate(u){ var cnt=Object.keys(u.correct).length; if(!cnt)return 0; var r=Object.values(u.correct).filter(function(v){return v;}).length; return Math.round(r/cnt*100); }
 
+function qTypeTag(q){ if(q.type==="multi")return "多选"; if(q.type==="judge")return "判断"; return "单选"; }
+function recordResult(cur, v, logAnswers){
+  if(logAnswers && state.quiz.on){ state.quiz.answers[cur.id]=v; }
+  var u=activeUser();
+  var isRight = v===cur.ans;
+  u.correct[cur.id]=isRight;
+  if(!isRight){ if(!u.wrong[cur.id])u.wrong[cur.id]=Date.now(); }
+  else { if(u.wrong[cur.id]){delete u.wrong[cur.id];} }
+  save();
+  return isRight;
+}
 function startQuiz(chId, isMock){
   var u=activeUser(); var data=DATASET[u.role];
   var pool = data.questions.filter(function(q){ return chId==="all" || q.ch===chId; });
@@ -226,46 +265,72 @@ function renderQuizArea(){
   var c=$(".content"); c.innerHTML="";
   var chMap={}; data.chapters.forEach(function(x){chMap[x.id]=x.title;});
   var cur=q.pool[q.idx];
+  var chosen=q.answers[cur.id];
+  var multi=cur.type==="multi";
   var head=el("div","quiz-head");
   head.innerHTML="<span class='quiz-progress'>📝 "+(q.idx+1)+" / "+q.pool.length+"</span><span class='quiz-progress'>当前：刷题模式</span>";
   c.appendChild(head);
   var card=el("div","q-card");
   card.innerHTML=
-    "<div class='q-meta'><span class='tag ch'>"+esc(chMap[cur.ch]||cur.ch)+"</span><span class='tag'>"+(cur.opts.length>0?"单选":"判断")+"</span></div>"+
+    "<div class='q-meta'><span class='tag ch'>"+esc(chMap[cur.ch]||cur.ch)+"</span><span class='tag'>"+qTypeTag(cur)+"</span></div>"+
     "<div class='q-text'>"+(q.idx+1)+". "+esc(cur.q)+"</div>"+
     cur.opts.map(function(o){return "<button class='opt' data-v='"+o.charAt(0)+"'>"+esc(o)+"</button>";}).join("")+
     "<div class='explain' id='explain'><b>✅ 答案 "+esc(cur.ans)+"</b><br>"+esc(cur.exp)+"</div>"+
-    "<div class='quiz-actions'><button class='btn' id='next'>下一题 →</button></div>";
+    (multi&&!chosen
+      ? "<div class='quiz-actions'><button class='btn' id='submit' disabled>提交答案（至少选 2 项）</button></div>"
+      : "<div class='quiz-actions'><button class='btn' id='next'>下一题 →</button></div>");
   c.appendChild(card);
-  var chosen=q.answers[cur.id];
   if(chosen){
     lockOptions(card, cur, chosen);
+  } else if(multi){
+    var sel={};
+    function refreshSubmit(){
+      var n=0,k; for(k in sel){ if(sel[k])n++; }
+      var sb=$("#submit",card);
+      if(!sb) return;
+      sb.disabled = n<2;
+      sb.textContent = n? "提交答案（已选 "+n+" 项）" : "提交答案（至少选 2 项）";
+    }
+    $$(".opt",card).forEach(function(btn){
+      btn.onclick=function(){
+        var v=btn.dataset.v;
+        if(sel[v]){ delete sel[v]; btn.classList.remove("selected"); }
+        else { sel[v]=1; btn.classList.add("selected"); }
+        refreshSubmit();
+      };
+    });
+    $("#submit",card).onclick=function(){
+      var v=Object.keys(sel).sort().join("");
+      if(!v) return;
+      recordResult(cur, v, true);
+      lockOptions(card, cur, v);
+    };
   } else {
     $$(".opt",card).forEach(function(btn){
       btn.onclick=function(){
         var v=btn.dataset.v;
         if(q.answers[cur.id]) return;
-        q.answers[cur.id]=v;
-        var isRight = v===cur.ans;
-        u.correct[cur.id]=isRight;
-        if(!isRight){ if(!u.wrong[cur.id])u.wrong[cur.id]=Date.now(); }
-        else { if(u.wrong[cur.id]){delete u.wrong[cur.id];} }
-        save();
+        recordResult(cur, v, true);
         lockOptions(card, cur, v);
       };
     });
   }
-  $("#next").onclick=function(){
-    if(q.idx < q.pool.length-1){ q.idx++; renderQuizArea(); }
-    else { q.finished=true; renderResult(u); }
-  };
+  var nb=$("#next",card);
+  if(nb){
+    nb.onclick=function(){
+      if(q.idx < q.pool.length-1){ q.idx++; renderQuizArea(); }
+      else { q.finished=true; renderResult(u); }
+    };
+  }
 }
 function lockOptions(card, cur, v){
+  var ansA=(cur.type==="multi"?cur.ans.split(""):[cur.ans]);
+  var vA=(cur.type==="multi"&&v?v.split(""):[v]);
   $$(".opt",card).forEach(function(btn){
-    btn.disabled=true;
+    btn.disabled=true; btn.classList.remove("selected");
     var bv=btn.dataset.v;
-    if(bv===cur.ans) btn.classList.add("correct");
-    else if(bv===v) btn.classList.add("wrong");
+    if(ansA.indexOf(bv)>=0) btn.classList.add("correct");
+    else if(vA.indexOf(bv)>=0) btn.classList.add("wrong");
   });
   $("#explain",card).classList.add("show");
 }
@@ -334,24 +399,54 @@ function redoWrong(id){
   var c=$(".content"); c.innerHTML="";
   var card=el("div","q-card");
   var chMap={}; data.chapters.forEach(function(x){chMap[x.id]=x.title;});
+  var multi=q.type==="multi";
   card.innerHTML=
-    "<div class='q-meta'><span class='tag ch' style='background:#ffe3e3;color:#c92a2a'>错题重做</span><span class='tag'>"+esc(chMap[q.ch]||"")+"</span></div>"+
+    "<div class='q-meta'><span class='tag ch' style='background:#ffe3e3;color:#c92a2a'>错题重做</span><span class='tag'>"+qTypeTag(q)+"</span></div>"+
     "<div class='q-text'>"+esc(q.q)+"</div>"+
     q.opts.map(function(o){return "<button class='opt' data-v='"+o.charAt(0)+"'>"+esc(o)+"</button>";}).join("")+
     "<div class='explain' id='explain'><b>✅ 答案 "+esc(q.ans)+"</b><br>"+esc(q.exp)+"</div>"+
-    "<div class='quiz-actions'><button class='btn ghost' id='back'>返回错题本</button></div>";
+    (multi
+      ? "<div class='quiz-actions'><button class='btn' id='submit' disabled>提交答案（至少选 2 项）</button><button class='btn ghost' id='back' style='margin-left:6px'>返回错题本</button></div>"
+      : "<div class='quiz-actions'><button class='btn ghost' id='back'>返回错题本</button></div>");
   c.appendChild(card);
-  $$(".opt",card).forEach(function(btn){
-    btn.onclick=function(){
-      if(btn.disabled)return; btn.disabled=true;
-      var v=btn.dataset.v; var isR=v===q.ans;
-      $$(".opt",card).forEach(function(b){ var bv=b.dataset.v; if(bv===q.ans)b.classList.add("correct"); else if(bv===v)b.classList.add("wrong"); });
-      $("#explain",card).classList.add("show");
-      if(isR){ delete u.wrong[q.id]; toast("答对了！已移出错题本 🎉"); }
-      else { toast("还是错的，再记一次 💪"); }
-      u.correct[q.id]=isR; save();
+  function doJudge(v){
+    var isR=recordResult(q, v, false);
+    lockOptions(card, q, v);
+    if(isR){ delete u.wrong[q.id]; toast("答对了！已移出错题本 🎉"); }
+    else { toast("还是错的，再记一次 💪"); }
+  }
+  if(multi){
+    var sel={};
+    function refreshSubmit(){
+      var n=0,k; for(k in sel){ if(sel[k])n++; }
+      var sb=$("#submit",card);
+      if(!sb) return;
+      sb.disabled = n<2;
+      sb.textContent = n? "提交答案（已选 "+n+" 项）" : "提交答案（至少选 2 项）";
+    }
+    $$(".opt",card).forEach(function(btn){
+      btn.onclick=function(){
+        var v=btn.dataset.v;
+        if(btn.disabled)return;
+        if(sel[v]){ delete sel[v]; btn.classList.remove("selected"); }
+        else { sel[v]=1; btn.classList.add("selected"); }
+        refreshSubmit();
+      };
+    });
+    $("#submit",card).onclick=function(){
+      var v=Object.keys(sel).sort().join("");
+      if(!v)return;
+      doJudge(v);
     };
-  });
+  } else {
+    $$(".opt",card).forEach(function(btn){
+      btn.onclick=function(){
+        if(btn.disabled)return;
+        var v=btn.dataset.v;
+        doJudge(v);
+      };
+    });
+  }
   $("#back").onclick=function(){ renderWrong(); };
 }
 
@@ -363,8 +458,11 @@ function renderSuper(){
   var c=$(".content"); c.innerHTML="";
 
   var head=el("div","card");
-  head.innerHTML="<h3>👫 互相监督</h3><p class='sub'>两人在各自设备学习后，把「我的同步码」复制给另一方，对方在下方粘贴导入，即可看到彼此进度并互放留言。</p>";
+  head.innerHTML="<h3>👫 互相监督</h3>"+
+    "<div id='cloudBadgeSuper' class='cloud-badge' style='display:none;margin-bottom:8px'></div>"+
+    "<p class='sub'>💡 建议在「设置」里开启<b>云端实时同步</b>：双方刷题/打卡/留言后对方秒收，无需手动传码。<br>若未开启，可使用下方同步码（进度快照）：刷完题点「生成同步码」发给对方，对方导入即可更新进度与留言，每次刷了新题需重发一次。</p>";
   c.appendChild(head);
+  refreshCloudUi();
 
   // 两张进度卡
   var grid=el("div","super-grid");
@@ -399,7 +497,16 @@ function renderSuper(){
     if(!r){ toast("同步码无效，请确认复制完整"); return; }
     DB.imported = DB.imported||{};
     DB.imported[r.role] = r.progress;
-    save(); renderSuper(); toast("已导入 "+r.roleName+" 的进度 ✅");
+    // 合并对方随同步码送来的留言（按 id 去重）
+    if(r.progress.msgs && r.progress.msgs.length){
+      DB.msgBoard = DB.msgBoard||[];
+      var has={}; DB.msgBoard.forEach(function(m){ if(m.id) has[m.id]=1; });
+      r.progress.msgs.forEach(function(m){
+        if(!has[m.id]){ DB.msgBoard.push(m); has[m.id]=1; }
+      });
+      save();
+    }
+    save(); renderSuper(); toast("已导入 "+r.roleName+" 的进度与留言 ✅");
   };
 
   // 对方进度展示（若导入过）
@@ -445,9 +552,12 @@ function renderMsgs(list, u){
   list.innerHTML="";
   if(!msgs.length){ list.innerHTML="<p class='sub' style='padding:6px 0'>还没有留言，来写第一句吧～</p>"; return; }
   msgs.forEach(function(m){
+    var isMe = m.role===u.role;
+    var av = m.role==="me" ? "🐴" : "🌹";
+    var who = m.role==="me" ? (DB.users.me.name||"我（药学）") : (DB.users.wife.name||"老婆（护理）");
     var item=el("div","msg-item");
-    item.innerHTML="<div class='av'>"+(m.role===u.role?"🐴":"🌹")+"</div>"+
-      "<div class='msg-bubble'><div class='who'>"+(m.role===u.role?u.name:otherUser().name)+" · "+m.time+"</div><p>"+esc(m.text)+"</p></div>";
+    item.innerHTML="<div class='av'>"+av+"</div>"+
+      "<div class='msg-bubble'"+(isMe?" style='background:linear-gradient(135deg,#e3fafc,#d0ebff)'":"")+"><div class='who'>"+(m.from||who)+" · "+m.time+"</div><p>"+esc(m.text)+"</p></div>";
     list.appendChild(item);
   });
 }
@@ -455,11 +565,15 @@ function sendMsg(u){
   var inp=$("#msgInput"); var v=inp.value.trim(); if(!v)return;
   if(!DB.msgBoard)DB.msgBoard=[];
   var d=new Date();
-  DB.msgBoard.push({text:v, role:u.role, time:(d.getMonth()+1)+"-"+d.getDate()+" "+String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0")});
+  DB.msgBoard.push({id:("m"+Date.now()+Math.floor(Math.random()*9999)), text:v, role:u.role, from:u.name, time:(d.getMonth()+1)+"-"+d.getDate()+" "+String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0")});
   inp.value=""; save(); renderSuper();
 }
 function encodeProgress(u){
-  var p={ role:u.role, name:u.name, correct:u.correct, wrong:u.wrong, checkins:u.checkins.slice(-90) };
+  // msgs：把这台设备上“属于当前用户”的留言打包进同步码，随进度一起送达对方
+  var myMsgs=(DB.msgBoard||[]).filter(function(m){return m.role===u.role;}).map(function(m){
+    return { id:m.id, role:m.role, from:m.from||u.name, text:m.text, time:m.time };
+  });
+  var p={ role:u.role, name:u.name, correct:u.correct, wrong:u.wrong, checkins:u.checkins.slice(-90), msgs:myMsgs };
   return btoa(unescape(encodeURIComponent(JSON.stringify(p)))).replace(/=+$/,"");
 }
 function decodeProgress(code){
@@ -486,6 +600,30 @@ function renderSetting(){
     "<div class='set-row'><div class='lbl'><b>重置我的数据</b><span>清空我的刷题、错题、打卡记录</span></div><button class='btn danger sm' id='resetMe'>重置</button></div>"+
     "<div class='set-row'><div class='lbl'><b>恢复默认全部数据</b><span>清空两人所有本机记录与留言</span></div><button class='btn danger sm' id='resetAll'>恢复默认</button></div>";
   c.appendChild(card);
+
+  // 云端实时同步
+  var cfg=cloudCfg();
+  var cloud=el("div","card");
+  cloud.innerHTML="<h3>☁️ 云端实时同步（免费）</h3>"+
+    "<p class='sub' style='margin-bottom:10px'>使用 Supabase 免费数据库让两台设备实时互通：<b>刷题 / 打卡 / 留言后对方秒收</b>，无需再手动发同步码。</p>"+
+    "<div class='cloud-field'><label>项目地址 URL</label><input id='cUrl' class='select-style' style='width:100%' placeholder='https://xxx.supabase.co' value='"+esc(cfg.url)+"'></div>"+
+    "<div class='cloud-field'><label>anon 公开密钥 Key</label><input id='cKey' class='select-style' style='width:100%' placeholder='eyJhbGciOiJ...（Project Settings → API）' value='"+esc(cfg.key)+"'></div>"+
+    "<div class='cloud-field'><label>同步房间号（两人填<b>相同</b>任意字符串即可互相通讯、与外界隔离）</label><input id='cRoom' class='select-style' style='width:100%' placeholder='如 pny2026-abc123' value='"+esc(cfg.room)+"'></div>"+
+    "<p class='sub' style='margin:8px 0'>当前状态：<b style='color:"+(cloudStatus==="on"?"#12b886":cloudStatus==="error"?"#fa5252":"#868e96")+"'>"+cloudSwitchDesc(cloudStatus)+"</b></p>"+
+    "<div style='display:flex;gap:10px;margin-top:4px'>"+
+      "<button class='btn ok' id='cloudOn'>启用并连接</button>"+
+      "<button class='btn danger' id='cloudOff'>断开连接</button>"+
+    "</div>"+
+    "<p class='sub' style='margin-top:10px;line-height:1.7'>首次使用：① supabase.com 免费注册并新建项目 → ② SQL Editor 粘贴执行建表语句（见项目 README）→ ③ 把 Project URL 与 anon key 填到上面，两头设备各自开启并填相同房间号即可。</p>";
+  c.appendChild(cloud);
+  $("#cloudOn").onclick=function(){
+    var url=$("#cUrl").value.trim(), key=$("#cKey").value.trim(), room=$("#cRoom").value.trim();
+    if(!url||!key||!room){ toast("请先填齐 URL、Key、房间号三项"); return; }
+    var c2=cloudCfg(); c2.url=url; c2.key=key; c2.room=room; c2.enabled=true; cloudSaveCfg(c2);
+    cloudInitStarted=false; initCloud(true);
+  };
+  $("#cloudOff").onclick=function(){ cloudDisable(); };
+
   var info=el("div","card");
   info.innerHTML="<h3>ℹ️ 报考信息速查</h3><div class='sub' style='line-height:2'>"+
     "📌 2026年普宁市医疗卫生等事业单位公开招聘 151 名<br>"+
@@ -506,6 +644,123 @@ function renderSetting(){
 }
 
 /* ============================================================
+ * 云端实时同步（Supabase 免费计划，可选）
+ * 表结构见项目 README：pny_sync(room,id,payload,updated_at)
+ * ============================================================ */
+function cloudCfg(){
+  try{ var c=JSON.parse(localStorage.getItem(CLOUD_KEY)); if(c) return c; }catch(e){}
+  return { url:"", key:"", room:"", enabled:false };
+}
+function cloudSaveCfg(c){ localStorage.setItem(CLOUD_KEY, JSON.stringify(c)); }
+function loadSupabaseJs(cb){
+  var s=document.createElement("script");
+  s.src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js";
+  s.onload=cb;
+  s.onerror=function(){ cloudStatus="error"; refreshCloudUi(); toast("无法加载 Supabase SDK，请检查网络"); };
+  document.head.appendChild(s);
+}
+function initCloud(force){
+  var cfg=cloudCfg();
+  if(!cfg.enabled || !cfg.url || !cfg.key || !cfg.room){ cloudStatus="off"; return; }
+  if(cloudInitStarted && !force) return;
+  cloudInitStarted=true;
+  cloudStatus="loading"; refreshCloudUi();
+  var init=function(){
+    if(!window.supabase){ cloudStatus="error"; refreshCloudUi(); return; }
+    try{
+      supabaseClient = window.supabase.createClient(cfg.url, cfg.key);
+      // 首次：拉取整房间数据，立即合并一次
+      supabaseClient.from(CLOUD_TABLE)
+        .select("id,payload")
+        .eq("room", cfg.room)
+        .then(function(res){
+          if(res.error){ cloudStatus="error"; refreshCloudUi(); toast("云同步连接失败："+res.error.message); return; }
+          (res.data||[]).forEach(function(row){ if(row.id && row.id!==DB.active) mergeRemote(row.payload, true); });
+          cloudStatus="on"; refreshCloudUi();
+          cloudPush();
+          toast("云同步已连接 ✅");
+        });
+      // 实时订阅：对方一改动，本机立即收到
+      cloudSub = supabaseClient.channel("pny-room-"+cfg.room)
+        .on("postgres_changes",
+          { event:"*", schema:"public", table:CLOUD_TABLE, filter:"room=eq."+cfg.room },
+          function(payload){
+            var row=payload.new;
+            if(row && row.id && row.id!==DB.active){
+              mergeRemote(row.payload, true);
+              toast("收到对方云端更新 📡");
+            }
+          })
+        .subscribe();
+    }catch(e){ cloudStatus="error"; refreshCloudUi(); toast("云同步初始化失败"); }
+  };
+  if(window.supabase) init(); else loadSupabaseJs(init);
+}
+function cloudDisable(){
+  if(cloudSub){ try{ supabaseClient && supabaseClient.removeChannel(cloudSub); }catch(e){} cloudSub=null; }
+  supabaseClient=null; cloudInitStarted=false; cloudStatus="off";
+  var cfg=cloudCfg(); cfg.enabled=false; cloudSaveCfg(cfg);
+  refreshCloudUi(); toast("已关闭云端实时同步");
+}
+function cloudPayload(role){
+  var u=DB.users[role];
+  var myMsgs=(DB.msgBoard||[]).filter(function(m){ return m.role===role; }).map(function(m){
+    return { id:m.id, role:m.role, from:m.from||u.name, text:m.text, time:m.time };
+  });
+  return { role:role, name:u.name, correct:u.correct||{}, wrong:u.wrong||{}, checkins:(u.checkins||[]).slice(-90), doneCh:u.doneCh||{}, msgs:myMsgs };
+}
+function cloudPush(){
+  if(!supabaseClient || cloudStatus!=="on") return;
+  var cfg=cloudCfg(); var p=cloudPayload(DB.active);
+  supabaseClient.from(CLOUD_TABLE)
+    .upsert({ room:cfg.room, id:DB.active, payload:JSON.stringify(p), updated_at:new Date().toISOString() })
+    .then(function(res){ if(res.error){ cloudStatus="error"; refreshCloudUi(); } });
+}
+function cloudQueuePush(){
+  if(!cloudCfg().enabled || !supabaseClient) return;
+  if(cloudQueue) clearTimeout(cloudQueue);
+  cloudQueue=setTimeout(function(){ cloudPush(); }, 600);
+}
+function mergeRemote(payloadJson, silent){
+  if(!payloadJson) return;
+  var p; try{ p=JSON.parse(payloadJson); }catch(e){ return; }
+  if(!p.role || p.role===DB.active) return;
+  var other=otherRole();
+  var changed=false;
+  DB.imported=DB.imported||{};
+  var oldImp=DB.imported[other];
+  var oldSolved= oldImp?Object.keys(oldImp.correct||{}).length:-1;
+  var newSolved=Object.keys(p.correct||{}).length;
+  if(newSolved!==oldSolved) changed=true;
+  DB.imported[other]={ role:other, name:p.name||otherUser().name, correct:p.correct||{}, wrong:p.wrong||{}, checkins:p.checkins||[], doneCh:p.doneCh||{} };
+  if(p.msgs && p.msgs.length){
+    DB.msgBoard=DB.msgBoard||[];
+    var has={}; DB.msgBoard.forEach(function(m){ if(m.id) has[m.id]=1; });
+    var added=0;
+    p.msgs.forEach(function(m){ if(!has[m.id]){ DB.msgBoard.push(m); has[m.id]=1; added++; } });
+    if(added>0) changed=true;
+  }
+  if(changed) save();
+  if(state.tab==="home") renderHome();
+  else if(state.tab==="super") renderSuper();
+  else renderTabs();
+}
+function cloudSwitchDesc(st){
+  return { off:"未开启", loading:"连接中…", on:"已连接", error:"连接异常" }[st] || "未开启";
+}
+function refreshCloudUi(){
+  var h=$("#cloudBadgeHome"); if(h) renderCloudBadge(h);
+  var s=$("#cloudBadgeSuper"); if(s) renderCloudBadge(s);
+}
+function renderCloudBadge(node){
+  var map={ off:["云同步未开启","#adb5bd"], loading:["云同步连接中…","#f59f00"], on:["云同步实时在线","#12b886"], error:["云同步连接异常","#fa5252"] };
+  var m=map[cloudStatus]||map.off;
+  node.style.display="inline-block";
+  node.style.background=m[1];
+  node.textContent=m[0];
+}
+
+/* ============================================================
  * 路由
  * ============================================================ */
 var TABMAP={ home:renderHome, study:renderStudy, quiz:renderQuiz, wrong:renderWrong, super:renderSuper, setting:renderSetting };
@@ -520,6 +775,7 @@ function showTab(tab){
 document.addEventListener("DOMContentLoaded",function(){
   $$(".tab-btn").forEach(function(b){ b.onclick=function(){ showTab(b.dataset.tab); }; });
   showTab("home");
+  initCloud(false); // 若此前已启用云端同步，自动重连
 });
 /* 适配旧数据结构迁移 */
 if(DB.users.me && !DB.users.me.avatar) DB.users.me.avatar="🐴";
