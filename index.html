@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>普宁医考 双人学习监督</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div id="app">
+  <!-- ===== 顶栏 ===== -->
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">🏥 <span>普宁医考·学习监督</span></div>
+      <div class="user-chip" id="userChip"></div>
+    </div>
+  </header>
+
+  <!-- ===== 导航 ===== -->
+  <nav class="tabbar" id="tabbar">
+    <button class="tab-btn active" data-tab="home">首页</button>
+    <button class="tab-btn" data-tab="study">复习</button>
+    <button class="tab-btn" data-tab="quiz">刷题</button>
+    <button class="tab-btn" data-tab="wrong">错题<span id="wrongBadge" class="badge hidden"></span></button>
+    <button class="tab-btn" data-tab="super">监督</button>
+    <button class="tab-btn" data-tab="setting">设置</button>
+  </nav>
+
+  <!-- ===== 内容区 ===== -->
+  <main id="content" class="content"></main>
+
+  <!-- ===== 底部 ===== -->
+  <footer class="footer">数据保存在本机浏览器 · 支持导出同步码与他人互相比对进度</footer>
+</div>
+
+<script src="assets/data-pharmacy.js"></script>
+<script src="assets/data-nursing.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>
