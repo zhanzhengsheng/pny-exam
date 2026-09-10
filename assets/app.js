@@ -171,6 +171,16 @@ function calcStreak(arr){
  * 复习
  * ============================================================ */
 function pointsHtml(ch){
+  // 若该章节已拆分子科目（subs），按小科目分组集中展示，每个知识点单独一行
+  if(ch.subs && ch.subs.length){
+    return ch.subs.map(function(sg){
+      var pts = (sg.points||[]).map(function(p){
+        return "<div class='point'><span class='dot'>•</span><span>"+esc(p)+"</span></div>";
+      }).join("");
+      return "<div class='sub-group'><div class='sub-head'>"+esc(sg.title)+
+        " <button class='btn sm ok quiz-sub' data-ch='"+esc(ch.id)+"' data-sub='"+esc(sg.id)+"'>去刷本题</button></div>"+pts+"</div>";
+    }).join("");
+  }
   return ch.points.map(function(p){return "<div class='point'><span class='dot'>•</span><span>"+esc(p)+"</span></div>";}).join("");
 }
 function mustKnowHtml(ch){
@@ -202,12 +212,21 @@ function renderStudy(){
       "<div class='chapter-body'>"+
         pointsHtml(ch)+
         (ch.mustKnow?mustKnowHtml(ch):"")+
-        "<div style='margin-top:10px'><button class='btn sm "+(done?"ghost":"ok")+"' data-ch='"+ch.id+"'>"+(done?"已掌握（点击取消）":"标记为已掌握 ✅")+"</button></div>"+
+        "<div style='margin-top:10px'><button class='btn sm "+(done?"ghost":"ok")+"' data-role='mkdone' data-ch='"+ch.id+"'>"+(done?"已掌握（点击取消）":"标记为已掌握 ✅")+"</button></div>"+
       "</div>";
     c.appendChild(box);
     $(".chapter-head",box).onclick=function(){ box.classList.toggle("open"); };
-    $("[data-ch]",box).onclick=function(e){ e.stopPropagation(); if(u.doneCh[ch.id]){delete u.doneCh[ch.id];}else{u.doneCh[ch.id]=true;} save(); renderStudy(); };
+    $("[data-role='mkdone']",box).onclick=function(e){ e.stopPropagation(); if(u.doneCh[ch.id]){delete u.doneCh[ch.id];}else{u.doneCh[ch.id]=true;} save(); renderStudy(); };
+    // 子科目「去刷本题」入口：直接跳转刷题页并筛选该小科目
+    $$(".quiz-sub",box).forEach(function(b){
+      b.onclick=function(e){ e.stopPropagation(); jumpQuiz(b.dataset.ch, b.dataset.sub); };
+    });
   });
+}
+// 直接进入某章节（可选小科目）的刷题
+function jumpQuiz(chId, subId){
+  state.tab="quiz"; renderTop(); renderTabs();
+  startQuiz(chId, false, subId||"");
 }
 
 /* ============================================================
@@ -222,11 +241,29 @@ function renderQuiz(){
   var selCh=el("select","select-style");
   selCh.innerHTML="<option value='all'>全部章节（随机）</option>"+data.chapters.map(function(ch){return "<option value='"+ch.id+"'>"+esc(ch.title)+"</option>";}).join("");
   setup.appendChild(selCh);
+  // 子科目筛选下拉：仅当所选章节拆分了子科目时显示
+  var selSub=el("select","select-style"); selSub.id="selSub";
+  selSub.style.display="none";
+  setup.appendChild(selSub);
+  function refreshSub(keepValue){
+    var chId=selCh.value;
+    var chapter=null;
+    data.chapters.forEach(function(x){ if(x.id===chId) chapter=x; });
+    if(chapter && chapter.subs && chapter.subs.length){
+      selSub.innerHTML="<option value=''>全部子科目</option>"+chapter.subs.map(function(sg){return "<option value='"+sg.id+"'>"+esc(sg.title)+"</option>";}).join("");
+      if(keepValue){ selSub.value=keepValue; }
+      selSub.style.display="";
+    } else {
+      selSub.style.display="none"; selSub.value="";
+    }
+  }
+  refreshSub("");
+  selCh.onchange=function(){ refreshSub(""); };
   var btnRow=el("div","quiz-actions");
   var b1=el("button","btn", "开始刷题"); var b2=el("button","btn warn","模拟卷（全卷20题）");
   btnRow.appendChild(b1); btnRow.appendChild(b2); setup.appendChild(btnRow);
   c.appendChild(setup);
-  b1.onclick=function(){ startQuiz(selCh.value, false); };
+  b1.onclick=function(){ var subId = selSub.style.display!=="none" ? selSub.value : ""; startQuiz(selCh.value, false, subId); };
   b2.onclick=function(){ startQuiz("all", true); };
 
   if(state.quiz.on){
@@ -247,9 +284,14 @@ function recordResult(cur, v, logAnswers){
   save();
   return isRight;
 }
-function startQuiz(chId, isMock){
+function startQuiz(chId, isMock, subId){
   var u=activeUser(); var data=DATASET[u.role];
-  var pool = data.questions.filter(function(q){ return chId==="all" || q.ch===chId; });
+  var pool = data.questions.filter(function(q){
+    if(chId!=="all" && q.ch!==chId) return false;
+    if(subId && q.sub!==subId) return false;
+    return true;
+  });
+  if(!pool.length){ state.quiz.on=false; renderQuiz(); toast("该分类下暂无题目，请换一个试试"); return; }
   // mock 模式抽 20 题
   if(isMock || pool.length>20){ pool = shuffle(pool).slice(0, Math.min(20, pool.length)); }
   else { pool = shuffle(pool); }
@@ -277,8 +319,8 @@ function renderQuizArea(){
     cur.opts.map(function(o){return "<button class='opt' data-v='"+o.charAt(0)+"'>"+esc(o)+"</button>";}).join("")+
     "<div class='explain' id='explain'><b>✅ 答案 "+esc(cur.ans)+"</b><br>"+esc(cur.exp)+"</div>"+
     (multi&&!chosen
-      ? "<div class='quiz-actions'><button class='btn' id='submit' disabled>提交答案（至少选 2 项）</button></div>"
-      : "<div class='quiz-actions'><button class='btn' id='next'>下一题 →</button></div>");
+      ? "<div class='quiz-actions'><button class='btn' id='submit' disabled>提交答案（至少选 2 项）</button>"+(q.idx>0?"<button class='btn ghost' id='prev'>← 上一题</button>":"")+"</div>"
+      : "<div class='quiz-actions'>"+(q.idx>0?"<button class='btn ghost' id='prev'>← 上一题</button>":"")+"<button class='btn' id='next'>下一题 →</button></div>");
   c.appendChild(card);
   if(chosen){
     lockOptions(card, cur, chosen);
@@ -320,6 +362,12 @@ function renderQuizArea(){
     nb.onclick=function(){
       if(q.idx < q.pool.length-1){ q.idx++; renderQuizArea(); }
       else { q.finished=true; renderResult(u); }
+    };
+  }
+  var pb=$("#prev",card);
+  if(pb){
+    pb.onclick=function(){
+      if(q.idx>0){ q.idx--; renderQuizArea(); }
     };
   }
 }
