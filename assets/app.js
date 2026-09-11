@@ -39,7 +39,8 @@ function defaultUser(role){
     wrong: {},     // 错题: {qid: firstWrongTime}
     doneCh: {},    // 章节读完: {chId:true}
     checkins: [],  // 打卡日期串
-    msgs: []       // 留言
+    msgs: [],      // 留言
+    session: null  // 刷题会话断点（刷新/重开可恢复进度）
   };
 }
 function loadDB(){
@@ -266,6 +267,17 @@ function renderQuiz(){
   b1.onclick=function(){ var subId = selSub.style.display!=="none" ? selSub.value : ""; startQuiz(selCh.value, false, subId); };
   b2.onclick=function(){ startQuiz("all", true); };
 
+  // 断点恢复：上次刷题未完成且保存过会话时，提供继续入口
+  if(u.session && u.session.on){
+    var cont=el("div","card");
+    cont.innerHTML="<h3>🔁 继续上次刷题</h3><p class='sub'>上次已在刷「"+esc(u.session.chId||"全部章节")+"」，进行到第 <b>"+(u.session.idx+1)+"</b> / "+u.session.poolIds.length+" 题，可从中断处继续，无需重头刷。</p>"+
+      "<button class='btn ok block' id='continueQuiz'>继续上次进度</button>"+
+      "<button class='btn ghost block' id='discardQuiz' style='margin-top:6px'>放弃断点，重新开始</button>";
+    c.appendChild(cont);
+    $("#continueQuiz").onclick=function(){ state.tab="quiz"; restoreSession(); };
+    $("#discardQuiz").onclick=function(){ u.session=null; save(); state.quiz.on=false; renderQuiz(); toast("已放弃上次进度，开始新一轮"); };
+  }
+
   if(state.quiz.on){
     renderQuizArea();
   }
@@ -296,6 +308,28 @@ function startQuiz(chId, isMock, subId){
   if(isMock || pool.length>20){ pool = shuffle(pool).slice(0, Math.min(20, pool.length)); }
   else { pool = shuffle(pool); }
   state.quiz = { on:true, pool:pool, idx:0, answers:{}, finished:false, wrongQuizMode:false };
+  u.session = { on:true, chId:chId, subId:subId||"", isMock:!!isMock, poolIds:pool.map(function(x){return x.id;}), idx:0, answers:{} };
+  save();
+  renderQuizArea();
+}
+
+/* ---------- 刷题会话持久化（刷新/重开恢复进度，药学/护理各自独立） ---------- */
+function syncSession(){
+  var u=activeUser(), q=state.quiz;
+  if(!u || !q || !q.on) return;
+  u.session = { on:true, chId:q.chId||"", subId:q.subId||"", isMock:!!q.isMock, poolIds:q.pool.map(function(x){return x.id;}), idx:q.idx, answers:q.answers||{} };
+  save();
+}
+function clearSession(){
+  var u=activeUser(); if(u && u.session) u.session=null; save();
+}
+function restoreSession(){
+  var u=activeUser(), data=DATASET[u.role], s=u.session;
+  if(!s || !s.on || !Array.isArray(s.poolIds)){ state.quiz.on=false; renderQuiz(); return; }
+  var byId={}; data.questions.forEach(function(q){ byId[q.id]=q; });
+  var pool=[]; s.poolIds.forEach(function(id){ if(byId[id]) pool.push(byId[id]); });
+  if(!pool.length || s.idx>=pool.length){ u.session=null; save(); state.quiz.on=false; renderQuiz(); toast("上次进度已完成，已为你重新开始"); return; }
+  state.quiz = { on:true, pool:pool, idx:s.idx||0, answers:s.answers||{}, finished:false, wrongQuizMode:false, chId:s.chId||"", subId:s.subId||"", isMock:!!s.isMock };
   renderQuizArea();
 }
 function shuffle(a){ for(var i=a.length-1;i>0;i--){ var j=Math.floor(Math.random()*(i+1)); var t=a[i];a[i]=a[j];a[j]=t;} return a; }
@@ -360,14 +394,14 @@ function renderQuizArea(){
   var nb=$("#next",card);
   if(nb){
     nb.onclick=function(){
-      if(q.idx < q.pool.length-1){ q.idx++; renderQuizArea(); }
+      if(q.idx < q.pool.length-1){ q.idx++; syncSession(); renderQuizArea(); }
       else { q.finished=true; renderResult(u); }
     };
   }
   var pb=$("#prev",card);
   if(pb){
     pb.onclick=function(){
-      if(q.idx>0){ q.idx--; renderQuizArea(); }
+      if(q.idx>0){ q.idx--; syncSession(); renderQuizArea(); }
     };
   }
 }
@@ -383,6 +417,7 @@ function lockOptions(card, cur, v){
   $("#explain",card).classList.add("show");
 }
 function renderResult(u){
+  u.session = null; save(); // 本轮完成：清断点，下次从「开始刷题」新建
   var q=state.quiz;
   var right=Object.values(q.answers).filter(function(v,i){var qid=q.pool[i].id;return q.answers[qid]===q.pool[i].ans;}).length;
   var c=$(".content"); c.innerHTML="";
